@@ -1,4 +1,5 @@
 #pragma once
+#include <pcap.h>
 #include "bfi.h"
 #include "scanner.h"
 #include "logger.h"

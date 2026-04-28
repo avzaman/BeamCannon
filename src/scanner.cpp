@@ -318,7 +318,6 @@ std::vector<ClientInfo> Scanner::scan_clients(const APInfo& ap,
 
         const uint8_t* mac_hdr = pkt + rt_len;
         uint8_t fc0 = mac_hdr[0];
-        uint8_t fc1 = mac_hdr[1];
 
         // Check frame type: management (00) and action subtype (1101)
         if ((fc0 & 0x0C) != 0x00) continue;

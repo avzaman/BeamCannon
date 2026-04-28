@@ -11,7 +11,7 @@
 // ---------------------------------------------------------------------------
 
 static std::string fmt_uptime(long s) {
-    char buf[16];
+    char buf[32];
     snprintf(buf, sizeof(buf), "%02ld:%02ld:%02ld", s/3600, (s%3600)/60, s%60);
     return std::string(buf);
 }
@@ -102,10 +102,6 @@ void Display::draw_attack_frame(const APInfo& ap,
                                   const std::string& log_path,
                                   double sounding_ms) {
     clear_screen();
-    const char* mode_str = (mode == AttackMode::PILLAGE)
-                           ? COL_RED "[ PILLAGING ]" COL_RESET
-                           : COL_YELLOW "[ PLUNDERING ]" COL_RESET;
-
     printf(COL_CYAN COL_BOLD
            "╔══════════════════════════════════════════════════╗\n"
            "║  B E A M C A N N O N  v1.0  %-21s║\n"
@@ -164,7 +160,7 @@ void Display::record_sample(const std::string& mac,
 }
 
 void Display::update_attack_stats(const AttackStats& stats,
-                                    const std::vector<InjectSample>& samples,
+                                    const std::vector<InjectSample>& /*samples*/,
                                     double sounding_ms,
                                     long uptime_s) {
     std::lock_guard<std::mutex> lock(mtx_);

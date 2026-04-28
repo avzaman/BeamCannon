@@ -74,7 +74,7 @@ static char wait_key() {
 // Auto-detect BFI parameters by capturing one real frame from the target
 // ---------------------------------------------------------------------------
 static bool autodetect_params(const std::string& iface,
-                                const APInfo& ap,
+                                const APInfo& /*ap*/,
                                 const std::vector<ClientInfo>& victims,
                                 BFIParams& out_params) {
     char errbuf[PCAP_ERRBUF_SIZE];

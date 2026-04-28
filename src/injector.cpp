@@ -135,7 +135,6 @@ bool Injector::inject_forged(const uint8_t* genuine_pkt,
     // genuine_pkt starts with radiotap header
     uint16_t rt_len = genuine_pkt[2] | (genuine_pkt[3] << 8);
     int mac_offset  = rt_len;
-    int body_offset = mac_offset + 24;
     int fcs_len     = 4;
 
     int forged_total = RADIOTAP_HDR_LEN

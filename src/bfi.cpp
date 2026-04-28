@@ -97,14 +97,6 @@ static int nst_from_bw(int bw_mhz, BFIStandard std) {
     }
 }
 
-// Number of Givens rotation angle pairs per column
-// Returns total angle count for matrix dimensions Nr x Nc
-static int num_angles(int Nr, int Nc) {
-    int count = 0;
-    for (int ii = 1; ii <= std::min(Nc, Nr - 1); ii++)
-        count += (Nr - ii) + (Nr - ii); // phi + psi per row
-    return count;
-}
 
 // ---------------------------------------------------------------------------
 // Frame detection
@@ -135,7 +127,6 @@ bool bfi_detect(const uint8_t* body, int body_len, BFIParams& out) {
         out.Nst = nst_from_bw(bw_mhz, BFIStandard::VHT);
         get_quantization_bits(out, out.Nb_phi, out.Nb_psi);
         // Calculate expected feedback byte length
-        int angles_per_sub = num_angles(out.Nr, out.Nc);
         int bits_per_sub = 0;
         for (int ii = 1; ii <= std::min(out.Nc, out.Nr - 1); ii++) {
             bits_per_sub += (out.Nr - ii) * out.Nb_phi;  // phi
@@ -229,7 +220,6 @@ FeedbackMatrix bfi_decompress(const uint8_t* feedback_bytes,
 
     // Reconstruct V matrices using Givens rotations (same as upstream)
     using CMat = Eigen::Matrix<std::complex<float>, Eigen::Dynamic, Eigen::Dynamic>;
-    using CVec = Eigen::Matrix<std::complex<float>, Eigen::Dynamic, 1>;
 
     FeedbackMatrix V(Nst_eff);
     for (int kk = 0; kk < Nst_eff; kk++) {
@@ -370,9 +360,10 @@ void bfi_compress(const FeedbackMatrix& matrices,
 FeedbackMatrix bfi_forge_disrupt(const FeedbackMatrix& genuine,
                                   const BFIParams& p) {
     using CMat = Eigen::Matrix<std::complex<float>, Eigen::Dynamic, Eigen::Dynamic>;
-    using CVec = Eigen::Matrix<std::complex<float>, Eigen::Dynamic, 1>;
 
     int Nst_eff = p.Nst;
+
+    using CVec = Eigen::Matrix<std::complex<float>, Eigen::Dynamic, 1>;
 
     // Fixed random seed for reproducibility across injections
     std::mt19937 rng(42);
@@ -426,14 +417,15 @@ FeedbackMatrix bfi_forge_disrupt(const FeedbackMatrix& genuine,
 // Forgery: plunder (victim forged orthogonal to beneficiary)
 // ---------------------------------------------------------------------------
 
-FeedbackMatrix bfi_forge_plunder(const FeedbackMatrix& victim_genuine,
+FeedbackMatrix bfi_forge_plunder(const FeedbackMatrix& /*victim_genuine*/,
                                   const FeedbackMatrix& beneficiary_genuine,
                                   const BFIParams& p) {
     using CMat = Eigen::Matrix<std::complex<float>, Eigen::Dynamic, Eigen::Dynamic>;
-    using CVec = Eigen::Matrix<std::complex<float>, Eigen::Dynamic, 1>;
 
     int Nst_eff = p.Nst;
     FeedbackMatrix W(Nst_eff);
+
+    using CVec = Eigen::Matrix<std::complex<float>, Eigen::Dynamic, 1>;
 
     // For plunder: forge victim's V to be orthogonal to beneficiary's V.
     // This eliminates inter-user interference at the beneficiary regardless
