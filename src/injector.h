@@ -83,7 +83,8 @@ private:
                        int genuine_len,
                        const uint8_t* forged_feedback,
                        int feedback_len,
-                       int feedback_offset_in_frame);
+                       int feedback_offset_in_frame,
+                       uint8_t dialog_token);
 
     // BPF filter string for capturing BFI frames from given MACs
     static std::string build_bpf(const std::vector<ClientInfo>& targets,

