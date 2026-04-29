@@ -16,6 +16,9 @@
 #include <ctime>
 #include <chrono>
 #include <iomanip>
+#include <cstdio>
+#include <cstdlib>
+#include <sys/time.h>
 
 // ---------------------------------------------------------------------------
 // Global state for signal handler
@@ -43,7 +46,7 @@ static std::string make_log_path() {
 
 static void print_usage(const char* prog) {
     printf("Usage: %s --iface <monitor_interface> [--log <logfile>]\n", prog);
-    printf("  --iface   Monitor mode interface (e.g. wlan0mon)\n");
+    printf("  --iface   Monitor mode interface (e.g. wlan1)\n");
     printf("  --log     Log file path (default: beamcannon_<timestamp>.log)\n");
     printf("\nMust be run as root.\n");
 }
@@ -127,6 +130,27 @@ static bool autodetect_params(const std::string& iface,
 }
 
 // ---------------------------------------------------------------------------
+// Set interface MTU to maximum supported value for larger frame injection
+// ---------------------------------------------------------------------------
+static void set_max_mtu(const std::string& iface) {
+    // Try progressively smaller MTU values until one succeeds.
+    // Higher MTU allows injecting larger HE BFI frames.
+    // Injector will cap Nst to fit within whatever MTU is actually set.
+    static const int mtu_values[] = {7935, 4096, 2304, 2048, 1500};
+    char cmd[128];
+    for (int mtu : mtu_values) {
+        snprintf(cmd, sizeof(cmd),
+                 "/sbin/ip link set %s mtu %d 2>/dev/null",
+                 iface.c_str(), mtu);
+        if (system(cmd) == 0) {
+            printf("[*] Interface MTU  : %d\n", mtu);
+            return;
+        }
+    }
+    printf("[*] Interface MTU  : 1500 (default)\n");
+}
+
+// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 int main(int argc, char* argv[]) {
@@ -164,7 +188,11 @@ int main(int argc, char* argv[]) {
     logger.info("BeamCannon started iface=" + iface + " log=" + log_path);
 
     printf("[*] Interface : " COL_WHITE "%s" COL_RESET "\n", iface.c_str());
-    printf("[*] Log file  : " COL_WHITE "%s" COL_RESET "\n\n", log_path.c_str());
+    printf("[*] Log file  : " COL_WHITE "%s" COL_RESET "\n", log_path.c_str());
+
+    // Set MTU to maximum supported before any capture or injection
+    set_max_mtu(iface);
+    printf("\n");
 
     Scanner scanner(iface);
 
@@ -401,12 +429,10 @@ int main(int argc, char* argv[]) {
                        .count();
 
     auto& st = injector.stats();
-    // Compute overall average compute time from the display's rolling windows
-    // (approximate: use last known values)
     logger.log_summary(st.total_broadsides.load(),
                         st.success_count.load(),
                         st.fail_count.load(),
-                        0.0,   // avg compute — logged per-injection already
+                        0.0,
                         sounding_ms,
                         total_s);
 
@@ -418,5 +444,3 @@ int main(int argc, char* argv[]) {
 
     return 0;
 }
-
-

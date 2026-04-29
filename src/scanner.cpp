@@ -182,17 +182,17 @@ bool Scanner::set_channel_iw(int channel, int bw_mhz, int center_freq2) {
     char cmd[256];
     if (bw_mhz <= 20) {
         snprintf(cmd, sizeof(cmd),
-                 "iw dev %s set channel %d 2>&1 >/dev/null",
+                 "/usr/sbin/iw dev %s set channel %d 2>&1 >/dev/null",
                  iface_.c_str(), channel);
     } else if (bw_mhz == 40) {
         snprintf(cmd, sizeof(cmd),
-                 "iw dev %s set channel %d HT40+ 2>&1 >/dev/null",
+                 "/usr/sbin/iw dev %s set channel %d HT40+ 2>&1 >/dev/null",
                  iface_.c_str(), channel);
     } else {
         // 80/160 MHz: use freq + width + center2
         int primary_freq = 5000 + 5 * channel;
         snprintf(cmd, sizeof(cmd),
-                 "iw dev %s set freq %d %d %d 2>&1 >/dev/null",
+                 "/usr/sbin/iw dev %s set freq %d %d %d 2>&1 >/dev/null",
                  iface_.c_str(), primary_freq, bw_mhz, center_freq2);
     }
     return system(cmd) == 0;
@@ -205,6 +205,12 @@ bool Scanner::lock_channel(int channel, int bw_mhz, int center_freq2) {
 std::vector<APInfo> Scanner::scan_aps() {
     // 5GHz channels to scan: non-DFS first (36-48), then DFS (52-144),
     // then UNII-3 (149-177)
+    // Scan all possible 5GHz primary channels at 20MHz.
+    // Beacons are always transmitted on the primary 20MHz channel regardless
+    // of the AP's operating bandwidth. The beacon IE contains the actual
+    // operating bandwidth which parse_beacon extracts.
+    // Scanning all channels including non-primary ones (e.g. 153 when primary
+    // is 149) ensures we catch APs regardless of their channel plan.
     static const int channels_5g[] = {
         36, 40, 44, 48,           // UNII-1
         52, 56, 60, 64,           // UNII-2A (DFS)
@@ -225,37 +231,42 @@ std::vector<APInfo> Scanner::scan_aps() {
     {
         char cmd[128];
         snprintf(cmd, sizeof(cmd),
-                 "iw dev %s set freq 5180 HT40+ 2>/dev/null",
+                 "/usr/sbin/iw dev %s set freq 5180 HT40+ 2>/dev/null",
                  iface_.c_str());
         system(cmd);
         usleep(100000); // 100ms for band switch to settle
     }
 
-    // Open a single persistent pcap handle for the entire scan.
-    // Use pcap_open_live (same path as tcpdump) rather than pcap_create/activate
-    // to avoid kernel oops in rtw88 PCIe driver on PCAP_TSTAMP_HOST_HIPREC call.
+    // Single persistent pcap handle for entire scan.
+    // Opening/closing per channel causes rapid promiscuous mode toggling
+    // which damages rtw88 USB drivers. Channel changes via iw work fine
+    // while pcap handle stays open on RTL8812BU.
     pcap_t* pcap = pcap_open_live(iface_.c_str(), 65535, 1, 50, errbuf);
     if (!pcap) return {};
+    pcap_setnonblock(pcap, 1, errbuf);
 
-    // Filter: beacon frames only
     struct bpf_program fp;
     const char* filter = "type mgt subtype beacon";
     if (pcap_compile(pcap, &fp, filter, 0, PCAP_NETMASK_UNKNOWN) == 0)
         pcap_setfilter(pcap, &fp);
 
-    // Dwell 250ms per channel, single handle stays open throughout
     for (int ci = 0; ci < n_channels; ci++) {
         int ch = channels_5g[ci];
-        set_channel_iw(ch, 40, 0);
-        usleep(50000); // 50ms settle time after channel change
+        // Scan at 20MHz - beacons always on primary 20MHz channel
+        set_channel_iw(ch, 20, 0);
+        usleep(100000); // 100ms settle after channel change
 
-        double t_end = now_secs() + 0.25; // 250ms dwell
+        // 500ms dwell covers 2.5x the standard 200ms beacon interval
+        double t_end = now_secs() + 0.50;
         struct pcap_pkthdr* hdr;
         const uint8_t* pkt;
 
         while (now_secs() < t_end) {
             int r = pcap_next_ex(pcap, &hdr, &pkt);
-            if (r != 1) continue;
+            if (r != 1) {
+                usleep(1000);
+                continue;
+            }
 
             uint16_t rt_len = pkt[2] | (pkt[3] << 8);
             if ((int)hdr->caplen < rt_len + 24) continue;
@@ -283,7 +294,7 @@ std::vector<APInfo> Scanner::scan_aps() {
         }
     }
 
-    pcap_close(pcap); // Close once after all channels scanned
+    pcap_close(pcap);
 
     std::vector<APInfo> result;
     result.reserve(seen.size());
@@ -304,6 +315,7 @@ std::vector<ClientInfo> Scanner::scan_clients(const APInfo& ap,
     char errbuf[PCAP_ERRBUF_SIZE];
     pcap_t* pcap = pcap_open_live(iface_.c_str(), 65535, 1, 50, errbuf);
     if (!pcap) return {};
+    pcap_setnonblock(pcap, 1, errbuf);
 
     // Capture management action frames from clients directed to this AP
     // and NDP announcement frames from the AP

