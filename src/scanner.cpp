@@ -1,6 +1,7 @@
 #include "scanner.h"
 #include "bfi.h"
 #include <pcap.h>
+#include <unistd.h>
 #include <cstring>
 #include <cstdio>
 #include <cmath>
@@ -218,21 +219,37 @@ std::vector<APInfo> Scanner::scan_aps() {
 
     char errbuf[PCAP_ERRBUF_SIZE];
 
-    // Dwell 100ms per channel
+    // Force NIC to 5GHz band before scanning.
+    // Some drivers initialise in 2.4GHz mode after monitor mode is set
+    // and will silently ignore channel number commands without this.
+    {
+        char cmd[128];
+        snprintf(cmd, sizeof(cmd),
+                 "iw dev %s set freq 5180 HT40+ 2>/dev/null",
+                 iface_.c_str());
+        system(cmd);
+        usleep(100000); // 100ms for band switch to settle
+    }
+
+    // Open a single persistent pcap handle for the entire scan.
+    // Use pcap_open_live (same path as tcpdump) rather than pcap_create/activate
+    // to avoid kernel oops in rtw88 PCIe driver on PCAP_TSTAMP_HOST_HIPREC call.
+    pcap_t* pcap = pcap_open_live(iface_.c_str(), 65535, 1, 50, errbuf);
+    if (!pcap) return {};
+
+    // Filter: beacon frames only
+    struct bpf_program fp;
+    const char* filter = "type mgt subtype beacon";
+    if (pcap_compile(pcap, &fp, filter, 0, PCAP_NETMASK_UNKNOWN) == 0)
+        pcap_setfilter(pcap, &fp);
+
+    // Dwell 250ms per channel, single handle stays open throughout
     for (int ci = 0; ci < n_channels; ci++) {
         int ch = channels_5g[ci];
-        set_channel_iw(ch, 20, 0);
+        set_channel_iw(ch, 40, 0);
+        usleep(50000); // 50ms settle time after channel change
 
-        pcap_t* pcap = pcap_open_live(iface_.c_str(), 65535, 1, 100, errbuf);
-        if (!pcap) continue;
-
-        // Filter: beacon frames only (type=0 subtype=8)
-        struct bpf_program fp;
-        const char* filter = "type mgt subtype beacon";
-        if (pcap_compile(pcap, &fp, filter, 0, PCAP_NETMASK_UNKNOWN) == 0)
-            pcap_setfilter(pcap, &fp);
-
-        double t_end = now_secs() + 0.10; // 100ms dwell
+        double t_end = now_secs() + 0.25; // 250ms dwell
         struct pcap_pkthdr* hdr;
         const uint8_t* pkt;
 
@@ -264,8 +281,9 @@ std::vector<APInfo> Scanner::scan_aps() {
             ap.rssi  = parse_rssi(pkt, (int)hdr->caplen);
             seen[bssid_str] = ap;
         }
-        pcap_close(pcap);
     }
+
+    pcap_close(pcap); // Close once after all channels scanned
 
     std::vector<APInfo> result;
     result.reserve(seen.size());

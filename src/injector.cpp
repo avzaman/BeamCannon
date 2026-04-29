@@ -61,19 +61,10 @@ void Injector::stop() {
 }
 
 bool Injector::open_handles(char* errbuf) {
-    sniff_handle_ = pcap_create(iface_.c_str(), errbuf);
+    // Use pcap_open_live throughout to avoid kernel oops in rtw88 PCIe driver.
+    // pcap_create/activate with PCAP_TSTAMP_HOST_HIPREC triggers a fault.
+    sniff_handle_ = pcap_open_live(iface_.c_str(), 65535, 1, 50, errbuf);
     if (!sniff_handle_) return false;
-
-    pcap_set_snaplen(sniff_handle_, 65535);
-    pcap_set_promisc(sniff_handle_, 1);
-    pcap_set_immediate_mode(sniff_handle_, 1);
-    pcap_set_tstamp_type(sniff_handle_, PCAP_TSTAMP_HOST_HIPREC);
-
-    if (pcap_activate(sniff_handle_) != 0) {
-        pcap_close(sniff_handle_);
-        sniff_handle_ = nullptr;
-        return false;
-    }
 
     send_handle_ = pcap_open_live(iface_.c_str(), 65535, 1, 0, errbuf);
     if (!send_handle_) {
