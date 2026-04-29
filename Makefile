@@ -1,31 +1,25 @@
-CXX      := g++
-CXXFLAGS := -std=c++17 -O3 -Wall -Wextra -I/usr/include/eigen3
-LIBS     := -lpcap -lpthread
+CXX = g++
+CXXFLAGS = -std=c++17 -O3 -Wall -Wextra -I/usr/include/eigen3
+LDFLAGS = -lpcap
 
-TARGET  := beamcannon
-SRCDIR  := src
-OBJDIR  := build
+SRC_DIR = src
+BUILD_DIR = build
 
-SRCS := $(wildcard $(SRCDIR)/*.cpp)
-OBJS := $(patsubst $(SRCDIR)/%.cpp,$(OBJDIR)/%.o,$(SRCS))
+SOURCES = $(wildcard $(SRC_DIR)/*.cpp)
+OBJECTS = $(patsubst $(SRC_DIR)/%.cpp,$(BUILD_DIR)/%.o,$(SOURCES))
+TARGET = beamcannon
 
-.PHONY: all clean install
+all: $(BUILD_DIR) $(TARGET)
 
-all: $(OBJDIR) $(TARGET)
+$(BUILD_DIR):
+	mkdir -p $(BUILD_DIR)
 
-$(OBJDIR):
-	mkdir -p $(OBJDIR)
-
-$(TARGET): $(OBJS)
-	$(CXX) $(CXXFLAGS) -o $@ $^ $(LIBS)
-	@echo "[+] Built: $(TARGET)"
-
-$(OBJDIR)/%.o: $(SRCDIR)/%.cpp
+$(BUILD_DIR)/%.o: $(SRC_DIR)/%.cpp
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
-clean:
-	rm -rf $(OBJDIR) $(TARGET)
+$(TARGET): $(OBJECTS)
+	$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS)
+	@echo "[+] Built: $(TARGET)"
 
-install: all
-	install -m 755 $(TARGET) /usr/local/bin/$(TARGET)
-	@echo "[+] Installed to /usr/local/bin/$(TARGET)"
+clean:
+	rm -rf $(BUILD_DIR) $(TARGET)

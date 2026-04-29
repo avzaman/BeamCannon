@@ -22,6 +22,7 @@
 #define FC_TYPE_MGMT            0x00
 #define FC_SUBTYPE_BEACON       0x80
 #define FC_SUBTYPE_ACTION       0xD0  // 0xD0 = 1101 0000
+#define FC_SUBTYPE_ACTION_NO_ACK 0xE0 // 0xE0 = 1110 0000
 
 // IE tags
 #define IE_SSID                 0
@@ -180,6 +181,22 @@ Scanner::~Scanner() {}
 
 bool Scanner::set_channel_iw(int channel, int bw_mhz, int center_freq2) {
     char cmd[256];
+    
+    // FORCED 80MHz OVERRIDE
+    // 5GHz channels start at 5000 + 5 * channel
+    int primary_freq = 5000 + 5 * channel;
+    
+    // Note: You must calculate the correct center frequency for the 80MHz block.
+    // For channels 36-48, the center is 5210. 
+    // For channels 149-161, the center is 5775.
+    int forced_center = (channel <= 48) ? 5210 : 5775; 
+
+    snprintf(cmd, sizeof(cmd),
+             "/usr/sbin/iw dev %s set freq %d 80 %d 2>&1 >/dev/null",
+             iface_.c_str(), primary_freq, forced_center);
+
+    return system(cmd) == 0;
+	/*char cmd[256];
     if (bw_mhz <= 20) {
         snprintf(cmd, sizeof(cmd),
                  "/usr/sbin/iw dev %s set channel %d 2>&1 >/dev/null",
@@ -196,6 +213,7 @@ bool Scanner::set_channel_iw(int channel, int bw_mhz, int center_freq2) {
                  iface_.c_str(), primary_freq, bw_mhz, center_freq2);
     }
     return system(cmd) == 0;
+	*/
 }
 
 bool Scanner::lock_channel(int channel, int bw_mhz, int center_freq2) {
@@ -320,11 +338,7 @@ std::vector<ClientInfo> Scanner::scan_clients(const APInfo& ap,
     // Capture management action frames from clients directed to this AP
     // and NDP announcement frames from the AP
     char filter[256];
-    snprintf(filter, sizeof(filter),
-             "type mgt and not (subtype beacon or subtype probe-req "
-             "or subtype probe-resp or subtype assoc-req or subtype assoc-resp "
-             "or subtype reassoc-req or subtype reassoc-resp "
-             "or subtype auth or subtype deauth or subtype disassoc)");
+    snprintf(filter, sizeof(filter), "wlan[0] == 0x54 or wlan[0] == 0xd0 or wlan[0] == 0xe0");
     struct bpf_program fp;
     if (pcap_compile(pcap, &fp, filter, 0, PCAP_NETMASK_UNKNOWN) == 0)
         pcap_setfilter(pcap, &fp);
@@ -346,11 +360,14 @@ std::vector<ClientInfo> Scanner::scan_clients(const APInfo& ap,
         uint16_t rt_len = pkt[2] | (pkt[3] << 8);
         if ((int)hdr->caplen < rt_len + 24) continue;
 
-        const uint8_t* mac_hdr = pkt + rt_len;
+	const uint8_t* mac_hdr = pkt + rt_len;
         uint8_t fc0 = mac_hdr[0];
+        uint8_t subtype = (fc0 & 0xFC);
 
-        // Check frame type: management (00) and action subtype (1101)
-        if ((fc0 & 0x0C) != 0x00) continue;
+        // Allow Control frames (0x04) specifically for NDPA (0x54)
+        // and Management frames (0x00) for BFI Actions (0xD0/0xE0)
+        uint8_t type = (fc0 & 0x0C);
+        if (type != 0x00 && subtype != 0x54) continue;
 
         const uint8_t* ta  = mac_hdr + 10; // Transmitter address
         const uint8_t* ra  = mac_hdr + 4;  // Receiver address (AP)
@@ -362,14 +379,23 @@ std::vector<ClientInfo> Scanner::scan_clients(const APInfo& ap,
         // The AP sends it to clients before NDP
         bool is_from_ap = (memcmp(ta, ap.bssid_raw, 6) == 0);
 
-        if (is_from_ap) {
-            // Record NDP announcement timing for sounding interval detection
-            // NDP announcement has category 21 (VHT) or 30 (HE), action 1
-            if ((body[0] == 0x15 || body[0] == 0x1e) && body[1] == 0x01) {
+	if (is_from_ap) {
+            // If the subtype is 0x54, it is an NDP Announcement. 
+            // We use this to calculate the router's sounding cadence.
+            if (subtype == 0x54) {
                 ndp_times.push_back(now_secs());
             }
             continue;
         }
+
+        //if (is_from_ap) {
+            // Record NDP announcement timing for sounding interval detection
+            // NDP announcement has category 21 (VHT) or 30 (HE), action 1
+          //  if ((body[0] == 0x15 || body[0] == 0x1e) && body[1] == 0x01) {
+          //      ndp_times.push_back(now_secs());
+          //  }
+          //  continue;
+        //}
 
         // BFI report from client to AP
         bool to_ap = (memcmp(ra, ap.bssid_raw, 6) == 0);
