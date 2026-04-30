@@ -20,6 +20,7 @@ struct ClientInfo {
 
 enum class AttackMode {
     NONE,
-    PILLAGE, // Disruption
-    PLUNDER  // Hijacking/Boosting
+    SU_PILLAGE, // Beam Nulling (Target Disruption)
+    MU_PILLAGE, // Cross-Talk Induction (Disrupts 2 users)
+    MU_PLUNDER  // Bandwidth Hijacking (Steals from Victim for QM)
 };

